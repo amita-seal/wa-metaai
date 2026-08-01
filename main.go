@@ -345,6 +345,10 @@ Rules for long-running commands: anything that does not exit on its own, such as
 must be backgrounded and its output redirected, e.g. "node server.js > /tmp/srv.log 2>&1 &". Running
 it in the foreground makes the tool call time out and the process is then killed, so a follow-up
 curl finds nothing listening.
+
+Rules for finishing: NEVER repeat a tool call that already appears above with its [TOOL RESULT].
+When the results above already contain what the user asked for, you are done: reply with the final
+answer as plain text, with no JSON and no tool call. Verifying the same thing twice is a mistake.
 `)
 	return b.String()
 }
@@ -379,6 +383,58 @@ func flatten(r chatReq) string {
 	}
 	return strings.Join(turns, "\n\n") + "\n\n[ASSISTANT]"
 }
+
+// canonicalJSON normalises argument formatting so "{\"a\":1}" and "{ \"a\": 1 }" compare equal.
+func canonicalJSON(s string) string {
+	var v any
+	if json.Unmarshal([]byte(s), &v) != nil {
+		return strings.Join(strings.Fields(s), "")
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return strings.Join(strings.Fields(s), "")
+	}
+	return string(out)
+}
+
+// priorCallCount reports how many times this exact tool call already appears in the transcript.
+// Meta AI will happily re-run a command it just ran, forever, so the shim has to notice.
+func priorCallCount(msgs []chatMsg, name, args string) int {
+	want := canonicalJSON(args)
+	n := 0
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if tc.Function.Name == name && canonicalJSON(orEmptyJSON(tc.Function.Arguments)) == want {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// stripToolJSON removes a fenced tool-call block from a reply that is being downgraded to plain
+// text, so the user never sees raw {"tool":...} JSON as their answer.
+func stripToolJSON(s string) string {
+	if fenced := betweenFences(s); fenced != "" && strings.Contains(fenced, `"tool"`) {
+		if i := strings.Index(s, "```"); i >= 0 {
+			rest := s[i+3:]
+			if j := strings.Index(rest, "```"); j >= 0 {
+				s = strings.TrimSpace(s[:i] + rest[j+3:])
+			} else {
+				s = strings.TrimSpace(s[:i])
+			}
+		}
+	}
+	if s == "" {
+		return "Done."
+	}
+	return s
+}
+
+const stopToolsInstruction = `
+[IMPORTANT] You just asked to run a tool call that already ran, and its result is in the transcript
+above. Do NOT output any tool call or JSON now. Reply with your final answer to the user as plain
+text.`
 
 func orEmptyJSON(s string) string {
 	if strings.TrimSpace(s) == "" {
@@ -455,6 +511,25 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 	name, args, isCall := "", "", false
 	if len(req.Tools) > 0 {
 		name, args, isCall = parseToolCall(reply)
+		// Meta AI loops: having run a command successfully it will re-run it indefinitely instead of
+		// answering. If it asks for a call already in the transcript, demand a plain-text answer
+		// instead, and if it still insists on a tool call, drop the tool call so the agent
+		// terminates with whatever text it produced.
+		if isCall && priorCallCount(req.Messages, name, args) > 0 {
+			log.Printf("== repeat of %s %s — forcing a final answer", name, args)
+			if retry, rerr := b.ask(r.Context(), prompt+stopToolsInstruction); rerr == nil && retry != "" {
+				reply = retry
+				if n2, a2, ok2 := parseToolCall(retry); ok2 && priorCallCount(req.Messages, n2, a2) == 0 {
+					name, args, isCall = n2, a2, ok2
+				} else {
+					name, args, isCall = "", "", false
+					reply = stripToolJSON(retry)
+				}
+			} else {
+				name, args, isCall = "", "", false
+				reply = stripToolJSON(reply)
+			}
+		}
 		if isCall {
 			log.Printf("== tool call: %s %s", name, args)
 		}

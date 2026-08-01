@@ -123,3 +123,38 @@ func TestExtractReplyUnwrapsStreamingEdits(t *testing.T) {
 		t.Errorf("collector should hold only the full text, got %q", got)
 	}
 }
+
+func TestPriorCallCountIgnoresFormatting(t *testing.T) {
+	var req chatReq
+	body := `{"messages":[
+	  {"role":"assistant","tool_calls":[{"function":{"name":"bash","arguments":"{\"command\":\"cat hello.txt\"}"}}]},
+	  {"role":"tool","content":"hello world"},
+	  {"role":"assistant","tool_calls":[{"function":{"name":"bash","arguments":"{ \"command\" : \"cat hello.txt\" }"}}]}
+	]}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatal(err)
+	}
+	if n := priorCallCount(req.Messages, "bash", `{"command":"cat hello.txt"}`); n != 2 {
+		t.Errorf("whitespace-different args should still match: got %d want 2", n)
+	}
+	if n := priorCallCount(req.Messages, "bash", `{"command":"ls"}`); n != 0 {
+		t.Errorf("different command should not match: got %d", n)
+	}
+	if n := priorCallCount(req.Messages, "write", `{"command":"cat hello.txt"}`); n != 0 {
+		t.Errorf("different tool should not match: got %d", n)
+	}
+}
+
+func TestStripToolJSON(t *testing.T) {
+	in := "Sure!\n```json\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}\n```\nAll set."
+	got := stripToolJSON(in)
+	if strings.Contains(got, `"tool"`) {
+		t.Errorf("tool JSON survived: %q", got)
+	}
+	if !strings.Contains(got, "All set.") {
+		t.Errorf("surrounding prose lost: %q", got)
+	}
+	if stripToolJSON("```json\n{\"tool\":\"x\",\"args\":{}}\n```") != "Done." {
+		t.Error("a reply that is only tool JSON should degrade to a placeholder")
+	}
+}
