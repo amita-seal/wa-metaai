@@ -158,3 +158,26 @@ func TestStripToolJSON(t *testing.T) {
 		t.Error("a reply that is only tool JSON should degrade to a placeholder")
 	}
 }
+
+func TestSanitizeArgsKeepsWorkInsideProject(t *testing.T) {
+	tmp := "/var/folders/sp/dpt45v7104lc76v27crlqzbm0000gn/T/opencode"
+	cases := []struct{ label, in, want string }{
+		{"abs temp filePath", `{"filePath":"` + tmp + `/sum.py","content":"x"}`, `{"content":"x","filePath":"sum.py"}`},
+		{"cd prefix stripped", `{"command":"cd ` + tmp + ` && touch sum.py"}`, `{"command":"touch sum.py"}`},
+		{"temp path inside command", `{"command":"python ` + tmp + `/sum.py"}`, `{"command":"python sum.py"}`},
+		// Unchanged input is returned verbatim rather than re-marshalled, so key order survives.
+		{"relative left alone", `{"filePath":"hello.txt","content":"hi"}`, `{"filePath":"hello.txt","content":"hi"}`},
+		{"unrelated abs path kept", `{"filePath":"/etc/hosts"}`, `{"filePath":"/etc/hosts"}`},
+		{"malformed json untouched", `not json`, `not json`},
+	}
+	for _, c := range cases {
+		got := sanitizeArgs(c.in)
+		if got != c.want {
+			t.Errorf("%s:\n got %s\nwant %s", c.label, got, c.want)
+		}
+	}
+	// A workdir that was only the temp dir should disappear rather than become empty.
+	if got := sanitizeArgs(`{"command":"ls","workdir":"` + tmp + `"}`); strings.Contains(got, "workdir") {
+		t.Errorf("empty workdir should be dropped, got %s", got)
+	}
+}

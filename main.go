@@ -12,6 +12,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -388,6 +390,57 @@ func flatten(r chatReq) string {
 	return strings.Join(turns, "\n\n") + "\n\n[ASSISTANT]"
 }
 
+var (
+	// opencode advertises a scratch directory in its bash tool description, and Meta AI treats that
+	// as where the user's files belong no matter how firmly the prompt says otherwise. Rewriting the
+	// arguments is the only fix that does not depend on it following instructions.
+	tempDirPath = regexp.MustCompile(`(?:/private)?/var/folders/[^/\s"']+/[^/\s"']+/T/opencode/?`)
+	leadingCD   = regexp.MustCompile(`^\s*cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*`)
+	pathKeys    = map[string]bool{"filePath": true, "path": true, "file": true, "filename": true}
+)
+
+// sanitizeArgs keeps tool calls inside the project directory: absolute paths into opencode's temp
+// scratch directory collapse to a bare filename, and a leading "cd ... &&" is dropped because the
+// bash session is persistent and already in the right place.
+func sanitizeArgs(args string) string {
+	var obj map[string]any
+	if json.Unmarshal([]byte(args), &obj) != nil {
+		return args
+	}
+	changed := false
+	for k, v := range obj {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		orig := s
+		if pathKeys[k] && tempDirPath.MatchString(s) {
+			s = path.Base(s)
+		}
+		if k == "command" || k == "workdir" {
+			s = leadingCD.ReplaceAllString(s, "")
+			s = tempDirPath.ReplaceAllString(s, "")
+			if k == "workdir" && strings.TrimSpace(s) == "" {
+				delete(obj, k)
+				changed = true
+				continue
+			}
+		}
+		if s != orig {
+			obj[k] = s
+			changed = true
+		}
+	}
+	if !changed {
+		return args
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return args
+	}
+	return string(out)
+}
+
 // canonicalJSON normalises argument formatting so "{\"a\":1}" and "{ \"a\": 1 }" compare equal.
 func canonicalJSON(s string) string {
 	var v any
@@ -515,6 +568,12 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 	name, args, isCall := "", "", false
 	if len(req.Tools) > 0 {
 		name, args, isCall = parseToolCall(reply)
+		if isCall {
+			if clean := sanitizeArgs(args); clean != args {
+				log.Printf("== rewrote args %s -> %s", args, clean)
+				args = clean
+			}
+		}
 		// Meta AI loops: having run a command successfully it will re-run it indefinitely instead of
 		// answering. If it asks for a call already in the transcript, demand a plain-text answer
 		// instead, and if it still insists on a tool call, drop the tool call so the agent
