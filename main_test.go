@@ -58,3 +58,25 @@ func TestToolPromptEmptyWithoutTools(t *testing.T) {
 		t.Error("expected no tool prompt when no tools are offered")
 	}
 }
+
+func TestLooksTruncated(t *testing.T) {
+	cases := []struct {
+		label string
+		text  string
+		want  bool
+	}{
+		{"empty", "", true},
+		{"plain prose", "The capital of France is Paris.", false},
+		{"closed fence", "```json\n{\"tool\":\"read\",\"args\":{}}\n```", false},
+		{"unclosed fence", "```json\n{\"tool\":\"write\",\"args\":{\"content\":\"const http", true},
+		// The exact shape that stalled the agent: a reply cut off mid-composition.
+		{"cut mid word", "Node HTTP server responding with n", false},
+		{"unbalanced braces", `{"tool":"write","args":{"content":"x"`, true},
+		{"balanced braces in prose", "use {} for an empty object", false},
+	}
+	for _, c := range cases {
+		if got := looksTruncated(c.text); got != c.want {
+			t.Errorf("%s: looksTruncated(%q)=%v want %v", c.label, c.text, got, c.want)
+		}
+	}
+}

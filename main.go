@@ -29,7 +29,7 @@ import (
 
 var (
 	botJID    = types.NewMetaAIJID
-	quietTime = envDuration("WA_QUIET_MS", 4000)
+	quietTime = envDuration("WA_QUIET_MS", 6000)
 	hardLimit = envDuration("WA_TIMEOUT_MS", 120000)
 	modelID   = "meta-ai"
 )
@@ -90,11 +90,32 @@ func (c *collector) wait() string {
 		case <-c.bump:
 			// keep waiting: more chunks are still arriving
 		case <-time.After(quietTime):
-			return c.value()
+			// Meta AI composes long answers in bursts and can pause mid-code-block for longer than
+			// the quiet window. Returning then yields a fragment, and a fragment of a tool call is
+			// unparseable JSON, which looks like the agent hanging. Keep waiting while the text is
+			// visibly unfinished.
+			if v := c.value(); !looksTruncated(v) {
+				return v
+			}
 		case <-deadline:
 			return c.value()
 		}
 	}
+}
+
+// looksTruncated reports whether a reply is obviously mid-composition: an unclosed ``` fence, or an
+// unbalanced JSON object, both of which mean more text is still coming.
+func looksTruncated(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.Count(s, "```")%2 != 0 {
+		return true
+	}
+	if opens, closes := strings.Count(s, "{"), strings.Count(s, "}"); opens != closes {
+		return true
+	}
+	return false
 }
 
 type bridge struct {
@@ -225,6 +246,10 @@ To run a tool, reply with ONLY this and nothing else, no prose before or after:
 ` + "```" + `
 You will then be given the tool's output as [TOOL RESULT] and may run another tool or answer.
 If you do not need a tool, just answer normally.
+
+Rules for file paths: write files to the project working directory using a RELATIVE path such as
+"server.js". Never write into a temporary directory, and ignore any temp directory path mentioned in
+a tool description above unless the user explicitly asked for it.
 `)
 	return b.String()
 }
