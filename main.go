@@ -396,6 +396,7 @@ var (
 	// arguments is the only fix that does not depend on it following instructions.
 	tempDirPath = regexp.MustCompile(`(?:/private)?/var/folders/[^/\s"']+/[^/\s"']+/T/opencode/?`)
 	leadingCD   = regexp.MustCompile(`^\s*cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*`)
+	emptyMkdir  = regexp.MustCompile(`\bmkdir\s+-p\s*&&\s*`)
 	pathKeys    = map[string]bool{"filePath": true, "path": true, "file": true, "filename": true}
 )
 
@@ -420,6 +421,9 @@ func sanitizeArgs(args string) string {
 		if k == "command" || k == "workdir" {
 			s = leadingCD.ReplaceAllString(s, "")
 			s = tempDirPath.ReplaceAllString(s, "")
+			// Removing the scratch path can leave "mkdir -p  && rest", whose empty operand makes the
+			// whole command fail. The directory it wanted to create is the one we are already in.
+			s = emptyMkdir.ReplaceAllString(s, "")
 			if k == "workdir" && strings.TrimSpace(s) == "" {
 				delete(obj, k)
 				changed = true

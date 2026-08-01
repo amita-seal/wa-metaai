@@ -181,3 +181,19 @@ func TestSanitizeArgsKeepsWorkInsideProject(t *testing.T) {
 		t.Errorf("empty workdir should be dropped, got %s", got)
 	}
 }
+
+func TestSanitizeArgsDropsEmptyMkdir(t *testing.T) {
+	tmp := "/var/folders/sp/dpt45v7104lc76v27crlqzbm0000gn/T/opencode"
+	got := sanitizeArgs(`{"command":"mkdir -p ` + tmp + ` && touch sum.py"}`)
+	if strings.Contains(got, "mkdir") {
+		t.Errorf("empty mkdir should be removed, got %s", got)
+	}
+	if !strings.Contains(got, "touch sum.py") {
+		t.Errorf("rest of the command must survive, got %s", got)
+	}
+	// A legitimate mkdir with a real operand must be left alone.
+	keep := sanitizeArgs(`{"command":"mkdir -p build && touch build/x"}`)
+	if !strings.Contains(keep, "mkdir -p build") {
+		t.Errorf("real mkdir was damaged: %s", keep)
+	}
+}
