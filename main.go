@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -30,6 +32,7 @@ import (
 var (
 	botJID    = types.NewMetaAIJID
 	quietTime = envDuration("WA_QUIET_MS", 6000)
+	graceTime = envDuration("WA_GRACE_MS", 18000)
 	hardLimit = envDuration("WA_TIMEOUT_MS", 120000)
 	modelID   = "meta-ai"
 )
@@ -85,27 +88,35 @@ func (c *collector) value() string {
 
 func (c *collector) wait() string {
 	deadline := time.After(hardLimit)
+	// Meta AI composes in bursts and extends its answer by editing the same message, so a pause is
+	// not the end. When the text still looks unfinished after the quiet window, wait out a bounded
+	// grace period instead of the full hard limit, which would make every terse reply crawl.
+	var grace <-chan time.Time
 	for {
 		select {
 		case <-c.bump:
-			// keep waiting: more chunks are still arriving
+			grace = nil // more text arrived; the answer is still growing
 		case <-time.After(quietTime):
-			// Meta AI composes long answers in bursts and can pause mid-code-block for longer than
-			// the quiet window. Returning then yields a fragment, and a fragment of a tool call is
-			// unparseable JSON, which looks like the agent hanging. Keep waiting while the text is
-			// visibly unfinished.
-			if v := c.value(); !looksTruncated(v) {
+			v := c.value()
+			if !looksTruncated(v) {
 				return v
 			}
+			if grace == nil {
+				grace = time.After(graceTime)
+			}
+		case <-grace:
+			return c.value()
 		case <-deadline:
 			return c.value()
 		}
 	}
 }
 
-// looksTruncated reports whether a reply is obviously mid-composition: an unclosed ``` fence, or an
-// unbalanced JSON object, both of which mean more text is still coming.
+// looksTruncated reports whether a reply is probably mid-composition: an unclosed ``` fence, an
+// unbalanced JSON object, or prose that simply stops without any closing punctuation. The last case
+// is what let "Here are some popular Python HTTP" through as if it were a finished answer.
 func looksTruncated(s string) bool {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return true
 	}
@@ -115,7 +126,10 @@ func looksTruncated(s string) bool {
 	if opens, closes := strings.Count(s, "{"), strings.Count(s, "}"); opens != closes {
 		return true
 	}
-	return false
+	// Decode the last rune rather than the last byte: replies routinely end in "…" or an emoji,
+	// both multibyte, and a byte comparison would misread them.
+	last, _ := utf8.DecodeLastRuneInString(s)
+	return unicode.IsLetter(last) || unicode.IsDigit(last) || strings.ContainsRune(",;-—", last)
 }
 
 type bridge struct {
@@ -211,7 +225,9 @@ func contentText(raw json.RawMessage) string {
 	if json.Unmarshal(raw, &s) == nil {
 		return s
 	}
-	var parts []struct{ Text string `json:"text"` }
+	var parts []struct {
+		Text string `json:"text"`
+	}
 	if json.Unmarshal(raw, &parts) == nil {
 		var b strings.Builder
 		for _, p := range parts {

@@ -69,10 +69,15 @@ func TestLooksTruncated(t *testing.T) {
 		{"plain prose", "The capital of France is Paris.", false},
 		{"closed fence", "```json\n{\"tool\":\"read\",\"args\":{}}\n```", false},
 		{"unclosed fence", "```json\n{\"tool\":\"write\",\"args\":{\"content\":\"const http", true},
-		// The exact shape that stalled the agent: a reply cut off mid-composition.
-		{"cut mid word", "Node HTTP server responding with n", false},
+		// The shapes that got returned as if finished, truncating visible output.
+		{"cut mid word", "Node HTTP server responding with n", true},
+		{"cut mid sentence", "Here are some popular Python HTTP", true},
 		{"unbalanced braces", `{"tool":"write","args":{"content":"x"`, true},
-		{"balanced braces in prose", "use {} for an empty object", false},
+		{"balanced braces in prose", "use {} for an empty object.", false},
+		{"ends with ellipsis", "Still working on it…", false},
+		{"ends with emoji", "All done 🎉", false},
+		{"trailing comma means more", "First, we install the deps,", true},
+		{"bare one word answer", "pomegranate", true},
 	}
 	for _, c := range cases {
 		if got := looksTruncated(c.text); got != c.want {
