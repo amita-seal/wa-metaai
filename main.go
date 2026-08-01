@@ -346,6 +346,10 @@ must be backgrounded and its output redirected, e.g. "node server.js > /tmp/srv.
 it in the foreground makes the tool call time out and the process is then killed, so a follow-up
 curl finds nothing listening.
 
+Rules for the shell: the bash session is persistent and already starts in the correct project
+directory, so never use "cd". A "cd" leaks into later commands and makes relative paths write to the
+wrong place.
+
 Rules for finishing: NEVER repeat a tool call that already appears above with its [TOOL RESULT].
 When the results above already contain what the user asked for, you are done: reply with the final
 answer as plain text, with no JSON and no tool call. Verifying the same thing twice is a mistake.
