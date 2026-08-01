@@ -94,6 +94,35 @@ to an absolute one. Two round trips, ~6s each.
 trivial one-file task already used 37k. Larger context — more files, longer histories — will hit that
 wall, and there is currently no truncation guard, so an oversized prompt fails rather than degrades.
 
+## Measured behaviour
+
+Five simple agentic tasks, run end to end through opencode. A "turn" is one request to this shim,
+which is one WhatsApp round trip. Two consecutive clean runs on the same build:
+
+| task | seconds | turns |
+|---|---|---|
+| create a file with given contents | 37-56 | 4 |
+| read a seeded file and report a value | 45-72 | 3 |
+| write a script, run it, report output | 109-111 | 5-7 |
+| edit a value in an existing JSON file | 65-74 | 4-5 |
+| count files matching a glob | 72-73 | 4 |
+
+About six minutes and roughly 23 turns for all five. Latency is transport, not thinking: every turn
+costs one ~6-7s WhatsApp round trip regardless of how hard the question is.
+
+## How Meta AI fails, and what the shim does about it
+
+Every one of these was found by running real tasks, and every one was first attempted as a prompt
+rule that Meta AI then ignored. Prompt rules did not hold; argument rewriting and refusals did.
+
+| failure | fix |
+|---|---|
+| re-runs a finished command forever (33 turns on a one-file task) | a repeat of a call already in the transcript is refused and a plain-text answer demanded |
+| writes into the temp directory opencode advertises | absolute scratch paths are rewritten to bare filenames |
+| invents a relative `opencode/` directory from the same advertisement | the scratch path is redacted from tool descriptions, and a leading `opencode/` is stripped (`WA_SCRATCH_DIR` to override) |
+| `cd`s out of the project, and the bash session is persistent | a leading `cd ... &&` is removed |
+| deletes the file it was just asked to create | `rm` is only relayed when the user asked to delete something |
+
 ## Limits
 
 | | |
