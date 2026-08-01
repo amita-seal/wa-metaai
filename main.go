@@ -352,6 +352,9 @@ Rules for the shell: the bash session is persistent and already starts in the co
 directory, so never use "cd". A "cd" leaks into later commands and makes relative paths write to the
 wrong place.
 
+Rules for files you create: never delete or clean up a file you were asked to create. The user wants
+it to remain on disk.
+
 Rules for finishing: NEVER repeat a tool call that already appears above with its [TOOL RESULT].
 When the results above already contain what the user asked for, you are done: reply with the final
 answer as plain text, with no JSON and no tool call. Verifying the same thing twice is a mistake.
@@ -444,6 +447,49 @@ func sanitizeArgs(args string) string {
 	}
 	return string(out)
 }
+
+var rmCommand = regexp.MustCompile(`(^|[;&|]\s*)rm\s`)
+
+// deletesOwnWork reports whether a bash call would delete a file created earlier in this same
+// conversation. Meta AI habitually "tidies up" by removing the file it was just asked to create,
+// which silently destroys the user's deliverable, so the call is refused rather than relayed.
+func deletesOwnWork(msgs []chatMsg, name, args string) bool {
+	if name != "bash" {
+		return false
+	}
+	var call map[string]any
+	if json.Unmarshal([]byte(args), &call) != nil {
+		return false
+	}
+	cmd, _ := call["command"].(string)
+	if cmd == "" || !rmCommand.MatchString(cmd) {
+		return false
+	}
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if tc.Function.Name != "write" {
+				continue
+			}
+			var wrote map[string]any
+			if json.Unmarshal([]byte(orEmptyJSON(tc.Function.Arguments)), &wrote) != nil {
+				continue
+			}
+			for key, v := range wrote {
+				if !pathKeys[key] {
+					continue
+				}
+				if p, ok := v.(string); ok && p != "" && strings.Contains(cmd, path.Base(p)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+const keepFilesInstruction = `
+[IMPORTANT] Do NOT delete the file you just created; the user wants it to stay. Do not output any
+tool call now. Reply with your final answer as plain text.`
 
 // canonicalJSON normalises argument formatting so "{\"a\":1}" and "{ \"a\": 1 }" compare equal.
 func canonicalJSON(s string) string {
@@ -577,6 +623,15 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 				log.Printf("== rewrote args %s -> %s", args, clean)
 				args = clean
 			}
+		}
+		if isCall && deletesOwnWork(req.Messages, name, args) {
+			log.Printf("== refused cleanup of created file: %s", args)
+			if retry, rerr := b.ask(r.Context(), prompt+keepFilesInstruction); rerr == nil && retry != "" {
+				reply = stripToolJSON(retry)
+			} else {
+				reply = "Created and verified the file."
+			}
+			name, args, isCall = "", "", false
 		}
 		// Meta AI loops: having run a command successfully it will re-run it indefinitely instead of
 		// answering. If it asks for a call already in the transcript, demand a plain-text answer

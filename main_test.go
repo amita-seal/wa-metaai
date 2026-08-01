@@ -197,3 +197,33 @@ func TestSanitizeArgsDropsEmptyMkdir(t *testing.T) {
 		t.Errorf("real mkdir was damaged: %s", keep)
 	}
 }
+
+func TestDeletesOwnWork(t *testing.T) {
+	var req chatReq
+	body := `{"messages":[
+	  {"role":"assistant","tool_calls":[{"function":{"name":"write","arguments":"{\"filePath\":\"sum.py\",\"content\":\"print(2+3)\"}"}}]},
+	  {"role":"tool","content":"Wrote file successfully."}
+	]}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatal(err)
+	}
+	if !deletesOwnWork(req.Messages, "bash", `{"command":"rm sum.py"}`) {
+		t.Error("removing the file it just wrote must be refused")
+	}
+	if !deletesOwnWork(req.Messages, "bash", `{"command":"python sum.py && rm sum.py"}`) {
+		t.Error("rm later in a chain must still be caught")
+	}
+	if deletesOwnWork(req.Messages, "bash", `{"command":"python sum.py"}`) {
+		t.Error("running the file is not a deletion")
+	}
+	if deletesOwnWork(req.Messages, "bash", `{"command":"rm scratch.log"}`) {
+		t.Error("deleting an unrelated file is allowed")
+	}
+	// "confirm" contains "rm" as a substring and must not trip the check.
+	if deletesOwnWork(req.Messages, "bash", `{"command":"echo confirm sum.py"}`) {
+		t.Error("substring 'rm' inside another word must not match")
+	}
+	if deletesOwnWork(req.Messages, "write", `{"command":"rm sum.py"}`) {
+		t.Error("only bash calls delete things")
+	}
+}
