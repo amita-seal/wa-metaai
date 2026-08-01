@@ -99,7 +99,7 @@ wall, and there is currently no truncation guard, so an oversized prompt fails r
 | | |
 |---|---|
 | tool-call reliability | prompted, not native. Meta AI is a consumer assistant, so it can answer in prose where a tool call was wanted; the loop stalls on that turn rather than recovering. |
-| streaming | reply is buffered then emitted as one chunk. Meta AI answers as *many separate messages* (~10 message IDs per answer), not edits to one, so they are joined in arrival order and considered complete after `WA_QUIET_MS` of silence. |
+| streaming | reply is buffered then emitted as one chunk. Meta AI streams by **editing one message** with the full answer so far; those edits arrive as a `protocolMessage` of type `MESSAGE_EDIT` that whatsmeow only unwraps on its history-sync path, so live edits must be unwrapped by hand or the reply stays stuck at the first fragment. Completion is inferred from `WA_QUIET_MS` of silence plus a heuristic that the text does not end mid-sentence, with `WA_GRACE_MS` as a bounded extra wait. |
 | system prompt | folded into a flattened transcript; there is no separate system role |
 | conversation state | one WhatsApp thread with its own memory, so history is resent each turn and Meta AI's own recall can bleed across requests |
 | concurrency | serialized — a single thread cannot serve parallel requests |
@@ -112,7 +112,8 @@ wall, and there is currently no truncation guard, so an oversized prompt fails r
 |---|---|---|
 | `WA_PORT` | `8788` | HTTP port |
 | `WA_PHONE` | — | required only for first-time pairing |
-| `WA_QUIET_MS` | `4000` | reply considered complete after this much silence |
+| `WA_QUIET_MS` | `6000` | reply considered complete after this much silence |
+| `WA_GRACE_MS` | `18000` | extra wait when the reply still looks unfinished |
 | `WA_TIMEOUT_MS` | `120000` | hard cap per request |
 
 ## Account durability

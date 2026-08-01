@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestParseToolCall(t *testing.T) {
@@ -83,5 +87,39 @@ func TestLooksTruncated(t *testing.T) {
 		if got := looksTruncated(c.text); got != c.want {
 			t.Errorf("%s: looksTruncated(%q)=%v want %v", c.label, c.text, got, c.want)
 		}
+	}
+}
+
+func TestExtractReplyUnwrapsStreamingEdits(t *testing.T) {
+	// Plain first fragment.
+	plain := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("A reverse proxy is a server")}}
+	id, text := extractReply(plain, "MSG1")
+	if id != "MSG1" || text != "A reverse proxy is a server" {
+		t.Fatalf("plain: got (%q,%q)", id, text)
+	}
+
+	// The streaming edit: full text inside protocolMessage, keyed at the original message ID.
+	full := "A reverse proxy is a server that sits between clients and servers."
+	edit := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:  &waCommon.MessageKey{ID: proto.String("MSG1")},
+		EditedMessage: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(full)},
+		},
+	}}
+	id2, text2 := extractReply(edit, "SOME_OTHER_EVENT_ID")
+	if id2 != "MSG1" {
+		t.Errorf("edit should key on the original message ID, got %q", id2)
+	}
+	if text2 != full {
+		t.Errorf("edit text: got %q want %q", text2, full)
+	}
+
+	// Same key means the collector replaces rather than concatenates.
+	c := newCollector()
+	c.put(id, text)
+	c.put(id2, text2)
+	if got := c.value(); got != full {
+		t.Errorf("collector should hold only the full text, got %q", got)
 	}
 }

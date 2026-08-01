@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -35,7 +37,30 @@ var (
 	graceTime = envDuration("WA_GRACE_MS", 18000)
 	hardLimit = envDuration("WA_TIMEOUT_MS", 120000)
 	modelID   = "meta-ai"
+	debug     = os.Getenv("WA_DEBUG") == "1"
 )
+
+// messageKinds lists which fields a received message actually carries, so an unhandled shape shows
+// up in the log instead of silently reading as empty text.
+func messageKinds(m *waE2E.Message) string {
+	if m == nil {
+		return "<nil>"
+	}
+	raw, err := protojson.Marshal(m)
+	if err != nil {
+		return "?"
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return "?"
+	}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
 
 func envDuration(key string, defMillis int) time.Duration {
 	if v := os.Getenv(key); v != "" {
@@ -47,9 +72,10 @@ func envDuration(key string, defMillis int) time.Duration {
 	return time.Duration(defMillis) * time.Millisecond
 }
 
-// collector gathers Meta AI's reply. It arrives as many separate messages rather than edits to
-// one, so replies are keyed by message ID and joined in arrival order; the answer is complete
-// once quietTime passes with nothing new.
+// collector gathers Meta AI's reply. It streams by editing one message with the full text so far,
+// so entries are keyed by message ID and a later edit replaces the earlier fragment; separate
+// messages still concatenate in arrival order. The answer is complete once quietTime passes with
+// nothing new and the text no longer looks unfinished.
 type collector struct {
 	mu    sync.Mutex
 	order []string
@@ -98,7 +124,11 @@ func (c *collector) wait() string {
 			grace = nil // more text arrived; the answer is still growing
 		case <-time.After(quietTime):
 			v := c.value()
-			if !looksTruncated(v) {
+			trunc := looksTruncated(v)
+			if debug {
+				log.Printf("~~ quiet elapsed len=%d truncated=%v grace=%v", len(v), trunc, grace != nil)
+			}
+			if !trunc {
 				return v
 			}
 			if grace == nil {
@@ -146,11 +176,25 @@ func (b *bridge) handle(raw any) {
 		return
 	}
 	if msg.Info.IsFromMe || msg.Info.Chat.String() != botJID.String() {
+		if debug {
+			if m, ok := raw.(*events.Message); ok {
+				log.Printf("~~ skipped chat=%s fromMe=%v", m.Info.Chat, m.Info.IsFromMe)
+			}
+		}
 		return
 	}
-	text := msg.Message.GetConversation()
-	if text == "" {
-		text = msg.Message.GetExtendedTextMessage().GetText()
+	id, text := extractReply(msg.Message, msg.Info.ID)
+	if debug {
+		log.Printf("~~ msg id=%s edit=%q len=%d kinds=%s", msg.Info.ID, msg.Info.Edit, len(text), messageKinds(msg.Message))
+		if text == "" {
+			if raw, err := protojson.Marshal(msg.Message); err == nil {
+				body := string(raw)
+				if len(body) > 900 {
+					body = body[:900] + "…"
+				}
+				log.Printf("~~ empty-text payload: %s", body)
+			}
+		}
 	}
 	if text == "" {
 		return
@@ -159,8 +203,38 @@ func (b *bridge) handle(raw any) {
 	c := b.active
 	b.activeM.RUnlock()
 	if c != nil {
-		c.put(msg.Info.ID, text)
+		c.put(id, text)
 	}
+}
+
+// extractReply pulls the reply text out of a received message, and returns the collector key it
+// belongs under.
+//
+// Meta AI streams by sending a short message and then repeatedly EDITING it with the full text so
+// far. Those edits arrive as a protocolMessage of type MESSAGE_EDIT whose payload holds the whole
+// answer, not a delta. whatsmeow only unwraps edits on its history-sync path, not on live messages,
+// so reading conversation/extendedTextMessage alone sees empty text and the answer stays stuck at
+// the first fragment. The edit's key ID is the original message's ID, so keying on it replaces the
+// fragment instead of appending a duplicate.
+func extractReply(m *waE2E.Message, fallbackID string) (id string, text string) {
+	id = fallbackID
+	if pm := m.GetProtocolMessage(); pm.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		if key := pm.GetKey().GetID(); key != "" {
+			id = key
+		}
+		if edited := pm.GetEditedMessage(); edited != nil {
+			if t := edited.GetConversation(); t != "" {
+				return id, t
+			}
+			if t := edited.GetExtendedTextMessage().GetText(); t != "" {
+				return id, t
+			}
+		}
+	}
+	if t := m.GetConversation(); t != "" {
+		return id, t
+	}
+	return id, m.GetExtendedTextMessage().GetText()
 }
 
 func (b *bridge) ask(ctx context.Context, prompt string) (string, error) {
