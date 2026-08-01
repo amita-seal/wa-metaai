@@ -250,6 +250,11 @@ If you do not need a tool, just answer normally.
 Rules for file paths: write files to the project working directory using a RELATIVE path such as
 "server.js". Never write into a temporary directory, and ignore any temp directory path mentioned in
 a tool description above unless the user explicitly asked for it.
+
+Rules for long-running commands: anything that does not exit on its own, such as starting a server,
+must be backgrounded and its output redirected, e.g. "node server.js > /tmp/srv.log 2>&1 &". Running
+it in the foreground makes the tool call time out and the process is then killed, so a follow-up
+curl finds nothing listening.
 `)
 	return b.String()
 }
