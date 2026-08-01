@@ -198,32 +198,35 @@ func TestSanitizeArgsDropsEmptyMkdir(t *testing.T) {
 	}
 }
 
-func TestDeletesOwnWork(t *testing.T) {
-	var req chatReq
-	body := `{"messages":[
-	  {"role":"assistant","tool_calls":[{"function":{"name":"write","arguments":"{\"filePath\":\"sum.py\",\"content\":\"print(2+3)\"}"}}]},
-	  {"role":"tool","content":"Wrote file successfully."}
-	]}`
-	if err := json.Unmarshal([]byte(body), &req); err != nil {
-		t.Fatal(err)
+func TestUnrequestedDeletion(t *testing.T) {
+	parse := func(body string) chatReq {
+		var r chatReq
+		if err := json.Unmarshal([]byte(body), &r); err != nil {
+			t.Fatal(err)
+		}
+		return r
 	}
-	if !deletesOwnWork(req.Messages, "bash", `{"command":"rm sum.py"}`) {
-		t.Error("removing the file it just wrote must be refused")
+	// The observed failure: it created the file with plain shell redirection, not the write tool,
+	// then deleted it. Tracking write-tool paths alone missed this.
+	create := parse(`{"messages":[{"role":"user","content":"Create a python file that prints 5 and run it"}]}`)
+	if !unrequestedDeletion(create.Messages, "bash", `{"command":"rm sum.py"}`) {
+		t.Error("rm must be refused when the user never asked to delete anything")
 	}
-	if !deletesOwnWork(req.Messages, "bash", `{"command":"python sum.py && rm sum.py"}`) {
-		t.Error("rm later in a chain must still be caught")
+	if unrequestedDeletion(create.Messages, "bash", `{"command":"python sum.py"}`) {
+		t.Error("running a file is not a deletion")
 	}
-	if deletesOwnWork(req.Messages, "bash", `{"command":"python sum.py"}`) {
-		t.Error("running the file is not a deletion")
+	if unrequestedDeletion(create.Messages, "bash", `{"command":"echo confirm"}`) {
+		t.Error("'confirm' contains rm as a substring and must not match")
 	}
-	if deletesOwnWork(req.Messages, "bash", `{"command":"rm scratch.log"}`) {
-		t.Error("deleting an unrelated file is allowed")
-	}
-	// "confirm" contains "rm" as a substring and must not trip the check.
-	if deletesOwnWork(req.Messages, "bash", `{"command":"echo confirm sum.py"}`) {
-		t.Error("substring 'rm' inside another word must not match")
-	}
-	if deletesOwnWork(req.Messages, "write", `{"command":"rm sum.py"}`) {
+	if unrequestedDeletion(create.Messages, "write", `{"command":"rm x"}`) {
 		t.Error("only bash calls delete things")
+	}
+
+	// When deletion is what was asked for, allow it.
+	for _, ask := range []string{"delete the temp files", "please remove build/", "clean up the logs"} {
+		req := parse(`{"messages":[{"role":"user","content":"` + ask + `"}]}`)
+		if unrequestedDeletion(req.Messages, "bash", `{"command":"rm -rf build"}`) {
+			t.Errorf("deletion asked for via %q must be allowed", ask)
+		}
 	}
 }

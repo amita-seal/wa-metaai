@@ -448,12 +448,17 @@ func sanitizeArgs(args string) string {
 	return string(out)
 }
 
-var rmCommand = regexp.MustCompile(`(^|[;&|]\s*)rm\s`)
+var (
+	rmCommand     = regexp.MustCompile(`(^|[;&|]\s*)rm\s`)
+	deletionWords = regexp.MustCompile(`\b(delete|remove|rm|clean ?up|unlink|erase)\b`)
+)
 
-// deletesOwnWork reports whether a bash call would delete a file created earlier in this same
-// conversation. Meta AI habitually "tidies up" by removing the file it was just asked to create,
-// which silently destroys the user's deliverable, so the call is refused rather than relayed.
-func deletesOwnWork(msgs []chatMsg, name, args string) bool {
+// unrequestedDeletion reports whether a bash call would delete files when the user never asked for
+// deletion. Meta AI habitually "tidies up" by removing the very file it was asked to create, and it
+// creates files with plain shell redirection as often as with the write tool, so tracking what it
+// wrote is not enough. Losing the user's deliverable is far worse than refusing a cleanup step, so
+// rm is only relayed when the request actually mentions deleting something.
+func unrequestedDeletion(msgs []chatMsg, name, args string) bool {
 	if name != "bash" {
 		return false
 	}
@@ -466,25 +471,14 @@ func deletesOwnWork(msgs []chatMsg, name, args string) bool {
 		return false
 	}
 	for _, m := range msgs {
-		for _, tc := range m.ToolCalls {
-			if tc.Function.Name != "write" {
-				continue
-			}
-			var wrote map[string]any
-			if json.Unmarshal([]byte(orEmptyJSON(tc.Function.Arguments)), &wrote) != nil {
-				continue
-			}
-			for key, v := range wrote {
-				if !pathKeys[key] {
-					continue
-				}
-				if p, ok := v.(string); ok && p != "" && strings.Contains(cmd, path.Base(p)) {
-					return true
-				}
-			}
+		if m.Role != "user" {
+			continue
+		}
+		if deletionWords.MatchString(strings.ToLower(contentText(m.Content))) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 const keepFilesInstruction = `
@@ -624,8 +618,8 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 				args = clean
 			}
 		}
-		if isCall && deletesOwnWork(req.Messages, name, args) {
-			log.Printf("== refused cleanup of created file: %s", args)
+		if isCall && unrequestedDeletion(req.Messages, name, args) {
+			log.Printf("== refused unrequested deletion: %s", args)
 			if retry, rerr := b.ask(r.Context(), prompt+keepFilesInstruction); rerr == nil && retry != "" {
 				reply = stripToolJSON(retry)
 			} else {
