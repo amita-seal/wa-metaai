@@ -1,3 +1,4 @@
 wametaai
 wametaai.db*
 *.log
+.claude/
