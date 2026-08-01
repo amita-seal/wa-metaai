@@ -153,12 +153,36 @@ func (b *bridge) ask(ctx context.Context, prompt string) (string, error) {
 	return reply, nil
 }
 
+type toolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type chatMsg struct {
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	Name       string          `json:"name"`
+	ToolCallID string          `json:"tool_call_id"`
+	ToolCalls  []toolCall      `json:"tool_calls"`
+}
+
+type toolDef struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Parameters  json.RawMessage `json:"parameters"`
+	} `json:"function"`
+}
+
 type chatReq struct {
-	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	} `json:"messages"`
-	Stream bool `json:"stream"`
+	Messages []chatMsg `json:"messages"`
+	Tools    []toolDef `json:"tools"`
+	Stream   bool      `json:"stream"`
 }
 
 func contentText(raw json.RawMessage) string {
@@ -177,19 +201,110 @@ func contentText(raw json.RawMessage) string {
 	return ""
 }
 
+// Meta AI has no native function calling, so tool use is prompted: the schemas go into the text and
+// a tool call comes back as a fenced JSON object which parseToolCall extracts. Kept deliberately
+// blunt — a consumer assistant ignores elaborate instructions more often than terse ones.
+func toolPrompt(tools []toolDef) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("[TOOLS]\nYou can run tools. Available tools:\n")
+	for _, t := range tools {
+		params := strings.TrimSpace(string(t.Function.Parameters))
+		if params == "" {
+			params = "{}"
+		}
+		fmt.Fprintf(&b, "\n- %s: %s\n  parameters (JSON Schema): %s\n",
+			t.Function.Name, t.Function.Description, params)
+	}
+	b.WriteString(`
+To run a tool, reply with ONLY this and nothing else, no prose before or after:
+` + "```json" + `
+{"tool": "<tool name>", "args": {<arguments matching the schema>}}
+` + "```" + `
+You will then be given the tool's output as [TOOL RESULT] and may run another tool or answer.
+If you do not need a tool, just answer normally.
+`)
+	return b.String()
+}
+
 func flatten(r chatReq) string {
 	var turns []string
+	if tp := toolPrompt(r.Tools); tp != "" {
+		turns = append(turns, tp)
+	}
 	for _, m := range r.Messages {
+		// An assistant turn that called a tool carries no content; replay the call so Meta AI can
+		// see what it already asked for and not loop on the same tool.
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				turns = append(turns, fmt.Sprintf("[ASSISTANT ran tool]\n{\"tool\": %q, \"args\": %s}",
+					tc.Function.Name, orEmptyJSON(tc.Function.Arguments)))
+			}
+			continue
+		}
 		t := contentText(m.Content)
 		if strings.TrimSpace(t) == "" {
 			continue
 		}
-		turns = append(turns, fmt.Sprintf("[%s]\n%s", strings.ToUpper(m.Role), t))
+		label := strings.ToUpper(m.Role)
+		if m.Role == "tool" {
+			label = "TOOL RESULT"
+		}
+		turns = append(turns, fmt.Sprintf("[%s]\n%s", label, t))
 	}
 	if len(turns) == 0 {
 		return ""
 	}
 	return strings.Join(turns, "\n\n") + "\n\n[ASSISTANT]"
+}
+
+func orEmptyJSON(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "{}"
+	}
+	return s
+}
+
+// parseToolCall pulls a {"tool":..,"args":..} object out of Meta AI's reply. It tolerates the
+// model wrapping the JSON in a fence or in chatter, which it frequently does.
+func parseToolCall(reply string) (name string, args string, ok bool) {
+	candidates := []string{}
+	if fenced := betweenFences(reply); fenced != "" {
+		candidates = append(candidates, fenced)
+	}
+	if start := strings.Index(reply, "{"); start >= 0 {
+		if end := strings.LastIndex(reply, "}"); end > start {
+			candidates = append(candidates, reply[start:end+1])
+		}
+	}
+	for _, c := range candidates {
+		var probe struct {
+			Tool string          `json:"tool"`
+			Args json.RawMessage `json:"args"`
+		}
+		if err := json.Unmarshal([]byte(c), &probe); err != nil || probe.Tool == "" {
+			continue
+		}
+		return probe.Tool, orEmptyJSON(string(probe.Args)), true
+	}
+	return "", "", false
+}
+
+func betweenFences(s string) string {
+	i := strings.Index(s, "```")
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+3:]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:] // drop an optional language tag such as ```json
+	}
+	if j := strings.Index(rest, "```"); j >= 0 {
+		return strings.TrimSpace(rest[:j])
+	}
+	return strings.TrimSpace(rest)
 }
 
 func tokens(s string) int { return (len(s) + 3) / 4 }
@@ -217,12 +332,28 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("<- %s", strings.ReplaceAll(reply, "\n", " | "))
 
 	created := time.Now().Unix()
+	name, args, isCall := "", "", false
+	if len(req.Tools) > 0 {
+		name, args, isCall = parseToolCall(reply)
+		if isCall {
+			log.Printf("== tool call: %s %s", name, args)
+		}
+	}
+	callID := "call_" + msgID()
+
 	if !req.Stream {
+		message := map[string]any{"role": "assistant", "content": reply}
+		finish := "stop"
+		if isCall {
+			finish = "tool_calls"
+			message = map[string]any{"role": "assistant", "content": nil,
+				"tool_calls": []any{map[string]any{"id": callID, "type": "function",
+					"function": map[string]string{"name": name, "arguments": args}}}}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"id": "chatcmpl-" + msgID(), "object": "chat.completion", "created": created, "model": modelID,
-			"choices": []any{map[string]any{"index": 0, "finish_reason": "stop",
-				"message": map[string]string{"role": "assistant", "content": reply}}},
+			"choices": []any{map[string]any{"index": 0, "finish_reason": finish, "message": message}},
 			"usage": map[string]int{"prompt_tokens": tokens(prompt), "completion_tokens": tokens(reply),
 				"total_tokens": tokens(prompt) + tokens(reply)},
 		})
@@ -243,8 +374,14 @@ func (b *bridge) serveChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	chunk(map[string]any{"role": "assistant"}, nil)
-	chunk(map[string]any{"content": reply}, nil)
-	chunk(map[string]any{}, "stop")
+	if isCall {
+		chunk(map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": callID,
+			"type": "function", "function": map[string]string{"name": name, "arguments": args}}}}, nil)
+		chunk(map[string]any{}, "tool_calls")
+	} else {
+		chunk(map[string]any{"content": reply}, nil)
+		chunk(map[string]any{}, "stop")
+	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()

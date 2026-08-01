@@ -53,7 +53,7 @@ number**. The session persists in `wametaai.db`, so later runs need no code.
       "name": "WhatsApp (Meta AI)",
       "options": { "baseURL": "http://localhost:8788/v1", "apiKey": "unused" },
       "models": {
-        "meta-ai": { "name": "Meta AI (WhatsApp)", "tool_call": false, "limit": { "context": 8000, "output": 4000 } }
+        "meta-ai": { "name": "Meta AI (WhatsApp)", "tool_call": true, "limit": { "context": 8000, "output": 4000 } }
       }
     }
   }
@@ -62,11 +62,43 @@ number**. The session persists in `wametaai.db`, so later runs need no code.
 
 Then `opencode run --model whatsapp/meta-ai "..."`.
 
+## Tool calling
+
+Meta AI has no native function calling, so the shim supplies it. When a request carries `tools`,
+`toolPrompt` renders each tool's name, description and JSON Schema into the prompt and asks for a
+single fenced object:
+
+```json
+{"tool": "<name>", "args": {...}}
+```
+
+`parseToolCall` extracts that — tolerating the fence, a language tag, and the surrounding chatter
+Meta AI likes to add — and the reply is returned as a real OpenAI `tool_calls` message with
+`finish_reason: "tool_calls"`, in both the JSON and SSE paths. Prior turns are replayed as
+`[ASSISTANT ran tool]` and `[TOOL RESULT]` so it can see what already ran.
+
+Verified working through opencode's real agent loop:
+
+```
+$ opencode run --model whatsapp/meta-ai "Read the file notes.txt and tell me the secret word."
+> build · meta-ai
+→ Read notes.txt
+pomegranate
+```
+
+Observed: opencode's full system prompt plus its tool schemas came to ~37,000 characters (~9k
+tokens) per request, and Meta AI handled it without complaint, correctly resolving a relative path
+to an absolute one. Two round trips, ~6s each.
+
+**The ceiling to watch:** a single WhatsApp text message caps out around 65k characters, and a
+trivial one-file task already used 37k. Larger context — more files, longer histories — will hit that
+wall, and there is currently no truncation guard, so an oversized prompt fails rather than degrades.
+
 ## Limits
 
 | | |
 |---|---|
-| tool calling | **none** — `tool_call: false` is load-bearing. Meta AI returns prose, so opencode's read/edit/bash agent loop cannot run on this model. Chat and questions only. |
+| tool-call reliability | prompted, not native. Meta AI is a consumer assistant, so it can answer in prose where a tool call was wanted; the loop stalls on that turn rather than recovering. |
 | streaming | reply is buffered then emitted as one chunk. Meta AI answers as *many separate messages* (~10 message IDs per answer), not edits to one, so they are joined in arrival order and considered complete after `WA_QUIET_MS` of silence. |
 | system prompt | folded into a flattened transcript; there is no separate system role |
 | conversation state | one WhatsApp thread with its own memory, so history is resent each turn and Meta AI's own recall can bleed across requests |
