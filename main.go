@@ -64,6 +64,15 @@ func messageKinds(m *waE2E.Message) string {
 	return strings.Join(keys, ",")
 }
 
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func envDuration(key string, defMillis int) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		var ms int
@@ -324,12 +333,16 @@ func toolPrompt(tools []toolDef) string {
 	var b strings.Builder
 	b.WriteString("[TOOLS]\nYou can run tools. Available tools:\n")
 	for _, t := range tools {
+		// opencode's bash description advertises an absolute scratch directory. Meta AI treats that
+		// as where work belongs, and even invents a relative "opencode/" directory from the name, so
+		// the mention is removed rather than argued with.
+		desc := tempDirPath.ReplaceAllString(t.Function.Description, "the working directory")
 		params := strings.TrimSpace(string(t.Function.Parameters))
 		if params == "" {
 			params = "{}"
 		}
 		fmt.Fprintf(&b, "\n- %s: %s\n  parameters (JSON Schema): %s\n",
-			t.Function.Name, t.Function.Description, params)
+			t.Function.Name, desc, params)
 	}
 	b.WriteString(`
 To run a tool, reply with ONLY this and nothing else, no prose before or after:
@@ -397,10 +410,14 @@ var (
 	// opencode advertises a scratch directory in its bash tool description, and Meta AI treats that
 	// as where the user's files belong no matter how firmly the prompt says otherwise. Rewriting the
 	// arguments is the only fix that does not depend on it following instructions.
-	tempDirPath = regexp.MustCompile(`(?:/private)?/var/folders/[^/\s"']+/[^/\s"']+/T/opencode/?`)
+	tempDirPath = regexp.MustCompile(`(?:/private)?/var/folders/(?:[^/\s"']+/)+T/opencode/?`)
 	leadingCD   = regexp.MustCompile(`^\s*cd\s+(?:'[^']*'|"[^"]*"|\S+)\s*&&\s*`)
 	emptyMkdir  = regexp.MustCompile(`\bmkdir\s+-p\s*&&\s*`)
-	pathKeys    = map[string]bool{"filePath": true, "path": true, "file": true, "filename": true}
+	// Set WA_SCRATCH_DIR="" if your project genuinely contains a directory by this name.
+	scratchDirName = firstNonEmpty(os.Getenv("WA_SCRATCH_DIR"), "opencode")
+	scratchPrefix  = regexp.MustCompile(`(^|[\s"'=])` + regexp.QuoteMeta(scratchDirName) + `/`)
+	scratchMkdir   = regexp.MustCompile(`\bmkdir\s+-p\s+` + regexp.QuoteMeta(scratchDirName) + `\s*(?:&&\s*)?`)
+	pathKeys       = map[string]bool{"filePath": true, "path": true, "file": true, "filename": true}
 )
 
 // sanitizeArgs keeps tool calls inside the project directory: absolute paths into opencode's temp
@@ -418,14 +435,20 @@ func sanitizeArgs(args string) string {
 			continue
 		}
 		orig := s
-		if pathKeys[k] && tempDirPath.MatchString(s) {
-			s = path.Base(s)
+		if pathKeys[k] {
+			if tempDirPath.MatchString(s) {
+				s = path.Base(s)
+			}
+			s = strings.TrimPrefix(s, scratchDirName+"/")
 		}
 		if k == "command" || k == "workdir" {
 			s = leadingCD.ReplaceAllString(s, "")
 			s = tempDirPath.ReplaceAllString(s, "")
 			// Removing the scratch path can leave "mkdir -p  && rest", whose empty operand makes the
 			// whole command fail. The directory it wanted to create is the one we are already in.
+			s = emptyMkdir.ReplaceAllString(s, "")
+			s = scratchMkdir.ReplaceAllString(s, "")
+			s = scratchPrefix.ReplaceAllString(s, "$1")
 			s = emptyMkdir.ReplaceAllString(s, "")
 			if k == "workdir" && strings.TrimSpace(s) == "" {
 				delete(obj, k)

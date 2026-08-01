@@ -230,3 +230,40 @@ func TestUnrequestedDeletion(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeArgsStripsInventedScratchDir(t *testing.T) {
+	// Observed: Meta AI invented a relative "opencode/" directory from the scratch path named in
+	// opencode's own tool description, so the file landed one level down and the task failed.
+	if got := sanitizeArgs(`{"filePath":"opencode/sum.py","content":"x"}`); !strings.Contains(got, `"filePath":"sum.py"`) {
+		t.Errorf("relative scratch prefix not stripped: %s", got)
+	}
+	got := sanitizeArgs(`{"command":"mkdir -p opencode && touch opencode/sum.py"}`)
+	if strings.Contains(got, "opencode") {
+		t.Errorf("scratch dir survived in command: %s", got)
+	}
+	if !strings.Contains(got, "touch sum.py") {
+		t.Errorf("rest of command damaged: %s", got)
+	}
+	if got := sanitizeArgs(`{"command":"python opencode/sum.py"}`); !strings.Contains(got, "python sum.py") {
+		t.Errorf("run command not corrected: %s", got)
+	}
+	// A path merely containing the word must survive.
+	if got := sanitizeArgs(`{"filePath":"docs/opencode-notes.md"}`); !strings.Contains(got, "docs/opencode-notes.md") {
+		t.Errorf("unrelated path damaged: %s", got)
+	}
+}
+
+func TestToolPromptRedactsScratchPath(t *testing.T) {
+	var tools []toolDef
+	body := `[{"type":"function","function":{"name":"bash","description":"Use /var/folders/sp/abc/xyz/T/opencode for temporary work outside the workspace.","parameters":{}}}]`
+	if err := json.Unmarshal([]byte(body), &tools); err != nil {
+		t.Fatal(err)
+	}
+	out := toolPrompt(tools)
+	if strings.Contains(out, "/var/folders") {
+		t.Errorf("scratch path should not reach the model: %s", out)
+	}
+	if !strings.Contains(out, "the working directory") {
+		t.Errorf("expected replacement text, got: %s", out)
+	}
+}
