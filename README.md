@@ -53,7 +53,7 @@ number**. The session persists in `wametaai.db`, so later runs need no code.
       "name": "WhatsApp (Meta AI)",
       "options": { "baseURL": "http://localhost:8788/v1", "apiKey": "unused" },
       "models": {
-        "meta-ai": { "name": "Meta AI (WhatsApp)", "tool_call": true, "limit": { "context": 8000, "output": 4000 } }
+        "meta-ai": { "name": "Meta AI (WhatsApp)", "tool_call": true, "limit": { "context": 16000, "output": 2000 } }
       }
     }
   }
@@ -90,9 +90,25 @@ Observed: opencode's full system prompt plus its tool schemas came to ~37,000 ch
 tokens) per request, and Meta AI handled it without complaint, correctly resolving a relative path
 to an absolute one. Two round trips, ~6s each.
 
-**The ceiling to watch:** a single WhatsApp text message caps out around 65k characters, and a
-trivial one-file task already used 37k. Larger context — more files, longer histories — will hit that
-wall, and there is currently no truncation guard, so an oversized prompt fails rather than degrades.
+**The ceiling, and who enforces it.** A single WhatsApp text message caps out around 65k characters,
+roughly 16k tokens, and a trivial one-file task already uses 37k characters. Past the cap Meta AI
+replies "There was a problem generating a response", which opencode surfaces as a generation error.
+An 81,953-character prompt built from one `webfetch` of a JSON payload is what first exposed this.
+
+Two layers keep it in check, and both matter:
+
+- **opencode's auto-compaction**, driven by the `limit` you declare in the provider config. It
+  compares the tokens this shim reports against `limit.context` minus the output reserve, so the
+  declared numbers must reflect WhatsApp's real ceiling: `context: 16000, output: 2000`. Understating
+  them (the original `8000`/`4000`) leaves ~4k usable tokens while normal traffic is ~10k, so
+  compaction fires on the wrong boundary. Note it is *reactive* — it acts on the previous response's
+  usage, so one turn that balloons from a single large tool result can still overshoot.
+- **This shim's own trim**, as the backstop for exactly that case: tool results are clipped
+  head-and-tail at `WA_MAX_TOOL_RESULT`, and if the prompt still exceeds `WA_MAX_CHARS` the oldest
+  middle turns are dropped with a note, keeping the tool definitions and the newest turns.
+
+The trim hides the ceiling rather than removing it: on a genuinely large session, earlier turns are
+silently dropped, so the model can lose detail it was told before.
 
 ## Measured behaviour
 
