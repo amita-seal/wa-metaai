@@ -40,6 +40,10 @@ var (
 	hardLimit = envDuration("WA_TIMEOUT_MS", 120000)
 	modelID   = "meta-ai"
 	debug     = os.Getenv("WA_DEBUG") == "1"
+	// A WhatsApp text message caps out around 65k characters. Past that Meta AI answers "There was a
+	// problem generating a response", so the prompt is trimmed to fit rather than sent and failed.
+	maxPrompt     = envInt("WA_MAX_CHARS", 60000)
+	maxToolResult = envInt("WA_MAX_TOOL_RESULT", 4000)
 )
 
 // messageKinds lists which fields a received message actually carries, so an unhandled shape shows
@@ -62,6 +66,26 @@ func messageKinds(m *waE2E.Message) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ",")
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// clip shortens an over-long block, keeping the head and tail because the useful parts of a tool
+// result are usually at both ends.
+func clip(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	keep := (max - 40) / 2
+	return s[:keep] + fmt.Sprintf("\n…[%d chars omitted]…\n", len(s)-keep*2) + s[len(s)-keep:]
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -397,13 +421,34 @@ func flatten(r chatReq) string {
 		label := strings.ToUpper(m.Role)
 		if m.Role == "tool" {
 			label = "TOOL RESULT"
+			t = clip(t, maxToolResult)
 		}
 		turns = append(turns, fmt.Sprintf("[%s]\n%s", label, t))
 	}
 	if len(turns) == 0 {
 		return ""
 	}
-	return strings.Join(turns, "\n\n") + "\n\n[ASSISTANT]"
+	return strings.Join(fitBudget(turns), "\n\n") + "\n\n[ASSISTANT]"
+}
+
+// fitBudget drops the oldest middle turns until the prompt fits. The first entry (the tool
+// definitions) and the most recent turns are what the next step actually needs, so they stay.
+func fitBudget(turns []string) []string {
+	total := 0
+	for _, t := range turns {
+		total += len(t) + 2
+	}
+	if total <= maxPrompt || len(turns) < 3 {
+		return turns
+	}
+	dropped := 0
+	for total > maxPrompt && len(turns) > 2 {
+		total -= len(turns[1]) + 2
+		turns = append(turns[:1], turns[2:]...)
+		dropped++
+	}
+	notice := fmt.Sprintf("[…%d earlier turns omitted to fit WhatsApp's message limit…]", dropped)
+	return append([]string{turns[0], notice}, turns[1:]...)
 }
 
 var (

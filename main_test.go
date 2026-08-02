@@ -267,3 +267,42 @@ func TestToolPromptRedactsScratchPath(t *testing.T) {
 		t.Errorf("expected replacement text, got: %s", out)
 	}
 }
+
+func TestFlattenFitsWhatsAppLimit(t *testing.T) {
+	// A webfetch of a large JSON blob produced an 81,953-char prompt, past WhatsApp's ~65k ceiling,
+	// and Meta AI replied "There was a problem generating a response".
+	huge := strings.Repeat("x", 50000)
+	req := chatReq{
+		Tools: []toolDef{{}},
+		Messages: []chatMsg{
+			{Role: "user", Content: json.RawMessage(`"start"`)},
+			{Role: "tool", Content: json.RawMessage(`"` + huge + `"`)},
+			{Role: "tool", Content: json.RawMessage(`"` + huge + `"`)},
+			{Role: "user", Content: json.RawMessage(`"what is the answer"`)},
+		},
+	}
+	out := flatten(req)
+	if len(out) > maxPrompt {
+		t.Errorf("prompt %d chars exceeds budget %d", len(out), maxPrompt)
+	}
+	// The newest instruction must survive trimming, or the model answers the wrong question.
+	if !strings.Contains(out, "what is the answer") {
+		t.Error("most recent turn was trimmed away")
+	}
+	if !strings.Contains(out, "[ASSISTANT]") {
+		t.Error("closing cue lost")
+	}
+}
+
+func TestClipKeepsBothEnds(t *testing.T) {
+	got := clip(strings.Repeat("a", 100)+strings.Repeat("b", 100), 120)
+	if len(got) > 120 {
+		t.Errorf("clip overshot: %d", len(got))
+	}
+	if !strings.HasPrefix(got, "a") || !strings.HasSuffix(got, "b") {
+		t.Errorf("head or tail lost: %q", got)
+	}
+	if clip("short", 120) != "short" {
+		t.Error("short input should be untouched")
+	}
+}
